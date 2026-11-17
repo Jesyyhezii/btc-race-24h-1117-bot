@@ -1,145 +1,170 @@
-// Burst-rider bot for the make.fun cbBTC bars-replay race
-// (agent-fun/bars-replay/v1).
+// Burst Rider — a cbBTC/USDC bot for the agent-fun/bars-replay/v1 harness.
 //
-// Protocol in one paragraph: the harness sends one hello, then one batch per
-// minute; each batch carries the bar that just closed, the fills of the orders
-// sent on the previous batch, and the account. The bot answers every batch
-// with one reply of orders; an order decided on one bar fills at the next
-// bar's open, paying a 4 bps fee, 2 bps of modelled slippage and
-// constant-product price impact against that bar's pool depth. A full-size
-// round trip costs roughly 26 bps, so a trade only pays when it rides a move
-// of several times that; this bot therefore trades rarely and on purpose.
+// The idea in plain words: cbBTC spends most minutes drifting sideways, and
+// a round trip through the pool costs roughly a quarter of a percent once
+// the fee, the modelled slippage and my own price impact are added up.
+// Chasing every wiggle therefore bleeds money. Instead this bot waits for
+// a genuine burst — a climb of at least one percent stretched over the
+// last thirty one-minute bars — and only then puts most of its cash to
+// work. While it holds, a trailing stop watches the position: the stop
+// stays dormant until the trade is at least 0.3% in profit, and from
+// there any fall of 0.3% below the best close seen since entry closes
+// the trade. After an exit the bot rests through a long cooldown, so a
+// single burst cannot be bought over and over on the way down.
 //
-// Design history, all of it graded on the kit's dev window with grade-local
-// (the same harness the server runs):
+// Every threshold below is tested with cross-multiplied bigints, never
+// floats, so the same stream of hello, batch and orders always produces
+// byte-identical replies: "up at least x percent" becomes the exact
+// integer identity now * DEN >= then * (DEN + x).
 //
-// - Build one paired a z-score dip buyer with an EMA-breakout trend leg.
-//   The dip buyer bled in a falling market (it kept catching a knife), and
-//   the breakout leg was whipsawed by false breakouts; together they lost
-//   about 17 USDC of the 1,000 USDC paper stake on the dev window.
-// - Build two added a washout-bounce leg (buy the first strong up bar after
-//   a hard drop) beside a momentum-burst leg. The bounce leg still lost
-//   money on its own and dragged the pair under water; the burst leg alone
-//   made money, and kept making it across a whole neighbourhood of exit
-//   settings, which is what a real signal (as opposed to a lucky fit) looks
-//   like on one window.
-// - This build is the burst leg alone, with the exits that neighbourhood
-//   supported: no fixed take-profit (a continuation trade should not be
-//   capped), a trailing stop that locks in the move once it has run, a hard
-//   stop underneath, and a maximum hold.
-//
-// The entry: when the return over the last BURST_WIN bars reaches
-// BURST_RISE and the close is the highest close of those bars, buy. That is
-// a tape that was quiet, moved hard for half an hour, and is still making
-// highs: on a one-minute BTC tape such bursts tend to continue for a while
-// rather than snap straight back, and the trailing stop is what turns that
-// tendency into kept profit while cutting the bursts that fail.
-//
-// Exits: a stop at STOP_LOSS under the entry cost; once the position has
-// been up at least TRAIL_ARM, a trailing stop TRAIL under the best value
-// seen since entry; and a maximum hold of MAX_HOLD bars. A long cooldown
-// follows every exit, and no position is opened near the end of the window,
-// where the end-of-window flatten would charge an exit for almost no
-// exposure. Size is half of equity: large enough for the PnL to matter,
-// small enough that the position's own price impact (about 8 bps a side at
-// the dev window's pool depth) stays well under the moves being ridden.
-//
-// Determinism: the bot is a pure function of the hello it received and the
-// bars since; it reads no clock, no environment and no file, and uses no
-// randomness at all, so the two graded executions agree byte for byte.
+// The wire protocol itself — hello once, one batch per closed bar,
+// exactly one reply of orders per batch, fills landing at the next bar's
+// open — is handled by the vendored shim; this file only picks orders.
 
 import { runBars, type BarsState, type OrderInput } from './vendor/makefun-bars.ts';
 
-const SYMBOL = 'CBBTC';
+// ---- the knobs of the strategy, named for what they do -------------------
 
-// --- parameters (tuned on the kit's dev window with grade-local) ---
-const BURST_WIN = 30; // bars over which a burst is measured
-const BURST_RISE = 0.010; // burst strength that buys the continuation (0.007 on the 20261115 window; raised on this kit's dev window, see README)
-const SIZE_FRAC = 0.9; // share of equity one position may spend
-const STOP_LOSS = -0.005; // exit when the position is down this share of cost
-const TRAIL_ARM = 0.003; // profit at which the trailing stop arms
-const TRAIL = 0.003; // trailing stop distance under the best value seen
-const MAX_HOLD = 300; // bars after which a position is closed regardless
-const COOLDOWN = 90; // bars to wait after an exit before entering again (shortened from 120: a follow-on burst needs its own 30-bar build, so 90 bars = 3x that build still blocks revenge re-entry, without locking out a genuinely new burst that forms 1-2h after an exit on the live race tape)
-const LAST_ENTRY_SEQ = 1380; // no new entries this close to the window's end
-const MAX_SLIPPAGE_BPS = 300; // generous: impact + slippage sit far under this
-const MIN_NOTIONAL = 1_000_000n; // a buy must spend at least 1 USDC
+/** Bars of history a burst is measured over (the build window). */
+const BUILD_BARS = 30;
+/** A burst counts only when the close gained at least this many bps over the build window: 100 bps = 1.00%. */
+const BURST_GAIN_BPS = 100n;
+/** Share of the cash pile a single entry may spend: 90 of every 100 units. */
+const ENTRY_SHARE_NUM = 90n;
+const ENTRY_SHARE_DEN = 100n;
+/** Gain over the entry price, in thousandths, that arms the trailing stop: 3 = +0.3%. */
+const TRAIL_ARM_PARTS = 3n;
+/** Fall from the running peak, in thousandths, that exits once the stop is armed: 3 = 0.3%. */
+const TRAIL_DROP_PARTS = 3n;
+/**
+ * Hard stop, in thousandths below the entry price: 5 = -0.5%. The trailing
+ * stop only arms after a gain, so without this a burst that reverses at
+ * once would be ridden all the way to the end-of-window flatten; the hard
+ * stop cuts that case short.
+ */
+const HARD_STOP_PARTS = 5n;
+/** Parts-per-thousand denominator shared by the two trailing thresholds. */
+const PARTS_DEN = 1_000n;
+/** Bars to stay flat after an exit before a new burst may be taken. */
+const REST_BARS = 90;
+/** Slippage cap sent with every order; wide on purpose, the signal is a fast move. */
+const SLIP_CAP_BPS = 10_000;
 
-// --- mutable run state (reset on hello) ---
-let closes: number[] = [];
-let entrySeq: number | null = null; // batch seq at which the open position was decided
-let peakPnl = 0; // best value/cost - 1 seen since entry
-let cooldownUntil = -1; // first seq at which a new entry is allowed again
+// ---- run state ------------------------------------------------------------
 
-function reset(): void {
-  closes = [];
-  entrySeq = null;
-  peakPnl = 0;
-  cooldownUntil = -1;
+/** Every close seen for the traded symbol this run, oldest first. */
+const closesSeen: bigint[] = [];
+/** Seq of the batch on which the open position was first observed; -1 while flat. */
+let entrySeq = -1;
+/** Effective entry price (position cost per unit, price-scale units) of the open trade. */
+let entryPrice: bigint | null = null;
+/** Highest close observed since the position appeared. */
+let peakSinceEntry: bigint | null = null;
+/** True once price has cleared entry + arm threshold; never un-arms within a trade. */
+let trailArmed = false;
+/** Whether the previous batch still held the position, to spot the exit bar. */
+let wasHolding = false;
+/** First seq at which a fresh entry is allowed again; 0 means no cooldown is running. */
+let restUntilSeq = 0;
+/** Guards against sending a second sell while the first is still travelling to its fill. */
+let exitPending = false;
+
+// ---- helpers ---------------------------------------------------------------
+
+/** The symbol this race trades: the first (and only) entry of the hello universe. */
+function tradedSymbol(state: BarsState): string {
+  return state.hello.symbols[0]!.symbol;
 }
 
-/** Return of the latest close over the closes of `win` bars ago. */
-function retOver(win: number): number | null {
-  if (closes.length < win + 1) return null;
-  return closes[closes.length - 1] / closes[closes.length - 1 - win] - 1;
+/**
+ * Recover the per-unit price the open position was filled at, in price
+ * units, from the account's own bookkeeping. cost_quote_units is what the
+ * fills charged in total (fees included) and qty sits at qty scale, while
+ * a price p means p / 10^price_scale USDC per whole unit, so:
+ *   price = cost * 10^(qty_scale + price_scale) / (qty * 10^quote_scale).
+ * Anchoring the trailing stop to the charged cost — not to the close of
+ * the bar that decided the buy — keeps its maths honest about the fill.
+ */
+function impliedEntryPrice(state: BarsState, symbol: string): bigint | null {
+  const held = state.positions.get(symbol);
+  const info = state.symbols.get(symbol);
+  if (held === undefined || info === undefined || held.qty === 0n) return null;
+  const scaled = held.cost * 10n ** BigInt(info.qty_scale + info.price_scale);
+  return scaled / (held.qty * 10n ** BigInt(state.hello.capital.quote_scale));
 }
 
-function buy(state: BarsState): OrderInput[] {
-  let notional = BigInt(Math.floor(Number(state.equity) * SIZE_FRAC));
-  const room = state.weightRoom(SYMBOL);
-  if (notional > room) notional = room;
-  if (notional < MIN_NOTIONAL) return [];
-  entrySeq = state.seq;
-  peakPnl = 0;
-  return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+/** True when the latest close gained at least BURST_GAIN_BPS over the close BUILD_BARS earlier. */
+function burstConfirmed(latest: bigint): boolean {
+  if (closesSeen.length <= BUILD_BARS) return false;
+  const earlier = closesSeen[closesSeen.length - 1 - BUILD_BARS]!;
+  return latest * 10_000n >= earlier * (10_000n + BURST_GAIN_BPS);
 }
 
-function sellAll(state: BarsState, qty: bigint): OrderInput[] {
-  entrySeq = null;
-  peakPnl = 0;
-  cooldownUntil = state.seq + COOLDOWN;
-  return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
-}
+// ---- the decision loop ------------------------------------------------------
 
 await runBars({
-  onHello() {
-    reset();
-  },
+  onBatch(state, batch): OrderInput[] {
+    const symbol = tradedSymbol(state);
+    const closeNow = state.close(symbol);
 
-  onBatch(state: BarsState): OrderInput[] {
-    const closeBig = state.close(SYMBOL);
-    if (closeBig === null) return [];
-    const close = Number(closeBig);
-    closes.push(close);
+    // A batch without our symbol's bar teaches nothing and changes nothing.
+    if (closeNow === null) return [];
+    closesSeen.push(closeNow);
 
+    const held = state.positions.get(symbol);
+    const holding = held !== undefined && held.qty > 0n;
+
+    // Spot the bar where a position appears: stamp the trade's anchors.
+    if (holding && !wasHolding) {
+      entrySeq = batch.seq;
+      entryPrice = impliedEntryPrice(state, symbol);
+      peakSinceEntry = closeNow;
+      trailArmed = false;
+      exitPending = false;
+    }
+    // Spot the bar where it vanished: the rest window starts counting here.
+    if (!holding && wasHolding) {
+      restUntilSeq = batch.seq + REST_BARS;
+      entrySeq = -1;
+      entryPrice = null;
+      peakSinceEntry = null;
+      trailArmed = false;
+      exitPending = false;
+    }
+    wasHolding = holding;
+
+    // Warm-up batches build history only; the harness rejects their orders.
     if (state.warmingUp) return [];
 
-    const holding = state.positions.get(SYMBOL);
-
-    // Manage the open position first: stop, trailing stop, time.
-    if (holding !== undefined && holding.qty > 0n) {
-      const value = state.value(SYMBOL, holding.qty);
-      const pnl = holding.cost > 0n ? Number(value) / Number(holding.cost) - 1 : 0;
-      if (pnl > peakPnl) peakPnl = pnl;
-      const held = entrySeq === null ? 0 : state.seq - entrySeq;
-      let exitNow = false;
-      if (pnl <= STOP_LOSS || held >= MAX_HOLD) {
-        exitNow = true;
-      } else if (peakPnl >= TRAIL_ARM && pnl <= peakPnl - TRAIL) {
-        exitNow = true;
+    // --- holding: only one question, whether the trailing stop says sell.
+    if (holding) {
+      if (peakSinceEntry === null || closeNow > peakSinceEntry) peakSinceEntry = closeNow;
+      if (entryPrice === null || peakSinceEntry === null) return [];
+      // The hard stop is checked first: it needs no arming and overrides the trail.
+      const hardStopTripped = closeNow * PARTS_DEN <= entryPrice * (PARTS_DEN - HARD_STOP_PARTS);
+      if (hardStopTripped && !exitPending) {
+        exitPending = true;
+        return [{ side: 'sell', symbol, qty: held!.qty, max_slippage_bps: SLIP_CAP_BPS }];
       }
-      return exitNow ? sellAll(state, holding.qty) : [];
+      if (!trailArmed && closeNow * PARTS_DEN >= entryPrice * (PARTS_DEN + TRAIL_ARM_PARTS)) {
+        trailArmed = true;
+      }
+      const stopTripped = trailArmed && closeNow * PARTS_DEN <= peakSinceEntry * (PARTS_DEN - TRAIL_DROP_PARTS);
+      if (stopTripped && !exitPending) {
+        exitPending = true;
+        return [{ side: 'sell', symbol, qty: held!.qty, max_slippage_bps: SLIP_CAP_BPS }];
+      }
+      return [];
     }
 
-    // Flat: enter only outside cooldown and before the window's tail, on a
-    // burst that closes at its window high.
-    if (state.seq < cooldownUntil || state.seq > LAST_ENTRY_SEQ) return [];
-    const burst = retOver(BURST_WIN);
-    if (burst !== null && burst >= BURST_RISE) {
-      const win = closes.slice(-BURST_WIN);
-      if (close >= Math.max(...win)) return buy(state);
-    }
+    // --- flat: rest through the cooldown, then wait for the next burst.
+    if (batch.seq < restUntilSeq) return [];
+    if (!burstConfirmed(closeNow)) return [];
 
-    return [];
+    let spend = (state.cash * ENTRY_SHARE_NUM) / ENTRY_SHARE_DEN;
+    const room = state.weightRoom(symbol);
+    if (spend > room) spend = room;
+    if (spend < BigInt(state.hello.fees.min_notional_quote_units)) return [];
+    return [{ side: 'buy', symbol, notional_quote_units: spend, max_slippage_bps: SLIP_CAP_BPS }];
   },
 });
