@@ -60,7 +60,7 @@ const STOP_LOSS = -0.005; // exit when the position is down this share of cost
 const TRAIL_ARM = 0.003; // profit at which the trailing stop arms
 const TRAIL = 0.003; // trailing stop distance under the best value seen
 const MAX_HOLD = 300; // bars after which a position is closed regardless
-const COOLDOWN = 120; // bars to wait after an exit before entering again
+const COOLDOWN = 90; // bars to wait after an exit before entering again (shortened from 120: a follow-on burst needs its own 30-bar build, so 90 bars = 3x that build still blocks revenge re-entry, without locking out a genuinely new burst that forms 1-2h after an exit on the live race tape)
 const LAST_ENTRY_SEQ = 1380; // no new entries this close to the window's end
 const MAX_SLIPPAGE_BPS = 300; // generous: impact + slippage sit far under this
 const MIN_NOTIONAL = 1_000_000n; // a buy must spend at least 1 USDC
